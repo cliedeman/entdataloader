@@ -1,0 +1,150 @@
+{{/* gotype: entgo.io/ent/entc/gen.Graph */}}
+
+{{ define "entdataloader" }}
+
+{{ $pkg := base $.Config.Package }}
+{{ template "header" $ }}
+
+import (
+    "context"
+	"sync"
+	"time"
+
+	{{ range $n := $.Nodes }}
+		"{{ $n.Config.Package }}/{{ $n.Package }}"
+	{{- end }}
+)
+
+{{- range $n := $.Nodes}}
+	{{- with $n.Edges }}
+		{{- range $i, $e := . }}
+		{{- if dataloaderEdge $e }}
+		{{$name := printf "%s%sDataloader" $n.Name (pascal $e.Name) }}
+		{{ $typeName := printf "%s" $e.Type.Name }}
+		{{ $fieldName := pascal (dataloaderFieldName $e) }}
+		{{ $plural := dataloaderPlural $e }}
+		type {{ $name }} struct {
+		    client *Client
+		    ctx context.Context
+	        wait time.Duration
+	        // maxBatch int
+
+            filter func(*{{ pascal $typeName }}Query) (*{{ pascal $typeName }}Query)
+            batch *{{ $name }}Batch
+
+            // mutex to prevent races
+            mu sync.Mutex
+		}
+
+		type {{ $name }}Option func(*{{ $name }})
+
+		func {{ $name }}WithWait(wait time.Duration) {{ $name }}Option {
+			return func(l *{{ $name }}) {
+        		l.wait = wait
+        	}
+		}
+
+        func {{ $name }}WithFilter(filter func(*{{ pascal $e.Type.Name }}Query) *{{ pascal $e.Type.Name }}Query) {{ $name }}Option {
+	        return func(l *{{ $name }}) {
+		        l.filter = filter
+	        }
+        }
+
+        func New{{ $name }}(ctx context.Context, client *Client, opts ...{{ $name }}Option) *{{ $name }} {
+            l := &{{ $name }}{
+                ctx:    ctx,
+                client: client,
+                wait: time.Millisecond * 500,
+            }
+            for _, opt := range opts {
+                opt(l)
+            }
+            return l
+        }
+
+        // TODO: make private
+        type {{ $name }}Batch struct {
+            keys    map[{{ $n.ID.Type }}]interface{}
+	        data    []*{{ $typeName }}
+	        error   error
+	        closing bool
+	        done    chan struct{}
+        }
+
+        func (l *{{ $name }}) Load(key {{ $n.ID.Type }}) ({{- if $plural }}[]{{- end -}}*{{ $typeName }}, error) {
+        	return l.LoadThunk(key)()
+        }
+
+        func (l *{{ $name }}) LoadThunk(key {{ $n.ID.Type }}) func() ({{- if $plural }}[]{{- end -}}*{{ $typeName }}, error) {
+        	l.mu.Lock()
+        	if l.batch == nil {
+        		l.batch = &{{ $name }}Batch{
+        		  done: make(chan struct{}),
+        		  keys: make(map[{{ $n.ID.Type }}]interface{}),
+        		}
+        		go l.batch.startTimer(l)
+        	}
+        	l.batch.keys[key] = nil
+        	batch := l.batch
+        	l.mu.Unlock()
+
+        	return func() ({{- if $plural }}[]{{- end -}}*{{ $typeName }}, error) {
+        		<-batch.done
+                if batch.error != nil {
+                    return nil, batch.error
+                }
+        		{{- if $plural }}
+                    var data []*{{ $typeName }}
+                    var err error
+                    for _, d := range batch.data {
+                        if d.{{ $fieldName }} == key {
+                            data = append(data, d)
+                        }
+                    }
+                    return data, err
+        		{{- else }}
+                    for _, d := range batch.data {
+                        if d.{{ $fieldName }} == key {
+                            return d, nil
+                        }
+                    }
+                    return nil, nil
+        		{{- end }}
+        	}
+        }
+
+        func (b *{{ $name }}Batch) startTimer(l *{{ $name }}) {
+        	time.Sleep(l.wait)
+        	l.mu.Lock()
+
+        	// we must have hit a batch limit and are already finalizing this batch
+        	if b.closing {
+        		l.mu.Unlock()
+        		return
+        	}
+
+        	l.batch = nil
+        	l.mu.Unlock()
+
+        	b.end(l)
+        }
+
+        func (b *{{ $name }}Batch) end(l *{{ $name }}) {
+	        var ids []{{ $n.ID.Type }}
+	        for id := range b.keys {
+		        ids = append(ids, id)
+	        }
+	        q := l.client.{{ $typeName }}.Query().
+                 	            Where({{ lower $e.Type.Name }}.{{ $fieldName }}In(ids...))
+            if l.filter != nil {
+              q = l.filter(q)
+            }
+	        b.data, b.error = q.All(l.ctx)
+        	close(b.done)
+        }
+		{{ end }}
+		{{ end }}
+	{{- end }}
+{{- end }}
+
+{{ end }}
